@@ -1,0 +1,5 @@
+.git
+.local
+.DS_Store
+Dockerfile
+compose.yaml

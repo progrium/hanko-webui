@@ -1,0 +1,17 @@
+# hankoid config for containers. Secrets and environment-specific values come from env vars
+# (e.g. DATABASE_PASSWORD, SECRETS_KEYS, SERVER_FRONTEND_ADMINS); see compose.yaml.
+database:
+  dialect: postgres
+  host: postgres
+  port: "5432"
+  user: hanko
+  database: hanko
+service:
+  name: Hanko
+server:
+  public:
+    address: ":8000"
+  admin:
+    address: ":8001"
+  frontend:
+    address: ":8080"

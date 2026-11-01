@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sign in</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:flex;flex-direction:column;background:#f4f6f9;color:#263248;font:14px system-ui}
+header{background:#17243b;color:white}
+.header-inner{max-width:1200px;margin:auto;padding:18px 24px}
+.brand{font-size:20px;font-weight:600}
+main{flex:1;display:flex;align-items:flex-start;justify-content:center;padding:48px 16px}
+.card{width:min(420px,100%);background:white;border:1px solid #dbe1ea;border-radius:9px;padding:8px 8px 4px}
+.note{max-width:420px;margin:14px auto 0;color:#6d788c;text-align:center}
+.error{padding:12px;background:#fff0f0;color:#a32239;border-radius:6px;margin:12px}
+hanko-auth{
+  --font-family:system-ui;--color:#263248;--color-shade-1:#6d788c;--color-shade-2:#cbd3df;
+  --brand-color:#245fd4;--brand-color-shade-1:#1d4fb0;--brand-contrast-color:white;
+  --background-color:white;--border-radius:6px;--container-padding:20px;--container-max-width:100%;
+}
+</style>
+</head>
+<body>
+<header><div class="header-inner"><div class="brand">Hanko</div></div></header>
+<main>
+  <div>
+    <div class="card"><hanko-auth id="auth"></hanko-auth><div id="error" class="error" hidden></div></div>
+    <p class="note" id="note"></p>
+  </div>
+</main>
+<script type="module">
+  // The frontend forwards Hanko public API routes, so the API lives on this origin.
+  const next = (() => {
+    const n = new URLSearchParams(location.search).get("next") || "/";
+    return n.startsWith("/") && !n.startsWith("//") && !n.startsWith("/\\") ? n : "/";
+  })();
+  if (next !== "/") document.getElementById("note").textContent = "Sign in to continue to " + next;
+  try {
+    const { register } = await import("https://cdn.jsdelivr.net/npm/@teamhanko/hanko-elements/dist/elements.js");
+    const { hanko } = await register(location.origin);
+    hanko.onSessionCreated(() => location.replace(next));
+  } catch (e) {
+    const el = document.getElementById("error");
+    el.textContent = "Could not load the sign-in form: " + e.message;
+    el.hidden = false;
+  }
+</script>
+</body>
+</html>

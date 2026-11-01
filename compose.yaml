@@ -1,0 +1,72 @@
+# Runs hankoid (public :8000, admin :8001, frontend :8080) against Postgres.
+#   docker compose up --build
+# Then register at http://localhost:8080/signin with an address listed in ADMINS (the
+# passcode email lands in Mailpit at http://localhost:8025) and open http://localhost:8080/admin/.
+name: hankoid
+
+x-hanko-env: &hanko-env
+  DATABASE_HOST: postgres
+  DATABASE_PASSWORD: "${POSTGRES_PASSWORD:-hanko}"
+  SECRETS_KEYS: "${SECRETS_KEYS:-change-me-local-dev-secret-key-0123456789}"
+  WEBAUTHN_RELYING_PARTY_ID: "${RP_ID:-localhost}"
+  WEBAUTHN_RELYING_PARTY_ORIGINS: "${ORIGIN:-http://localhost:8080}"
+  CORS_ALLOW_ORIGINS: "${ORIGIN:-http://localhost:8080}"
+  # Plain-http local setup; set to true behind TLS.
+  SESSION_COOKIE_SECURE: "${COOKIE_SECURE:-false}"
+  SERVER_FRONTEND_ADMINS: "${ADMINS:-admin@example.com}"
+  # Passcode emails go to Mailpit (web inbox at http://localhost:8025). Point at real SMTP elsewhere.
+  EMAIL_DELIVERY_SMTP_HOST: "${SMTP_HOST:-mailpit}"
+  EMAIL_DELIVERY_SMTP_PORT: "${SMTP_PORT:-1025}"
+services:
+  postgres:
+    image: postgres:17-alpine
+    # Pin to the host arch so Docker doesn't reuse a cached image for another platform (e.g. linux/386).
+    platform: "${PLATFORM:-linux/arm64}"
+    environment:
+      POSTGRES_USER: hanko
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-hanko}"
+      POSTGRES_DB: hanko
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hanko -d hanko"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  mailpit:
+    image: axllent/mailpit:latest
+    platform: "${PLATFORM:-linux/arm64}"
+    ports:
+      - "127.0.0.1:${SMTP_PORT_HOST:-1025}:1025"
+      - "127.0.0.1:${MAILPIT_UI_PORT:-8025}:8025"
+
+  migrate:
+    build: .
+    platform: "${PLATFORM:-linux/arm64}"
+    command: ["migrate", "up", "--config", "/config/config.yaml"]
+    environment: *hanko-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  hankoid:
+    build: .
+    platform: "${PLATFORM:-linux/arm64}"
+    environment: *hanko-env
+    ports:
+      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:8001:8001"
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      mailpit:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  pgdata:
