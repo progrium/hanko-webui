@@ -27,6 +27,10 @@ func fake(w http.ResponseWriter, r *http.Request) {
 			io.WriteString(w, `{"is_valid":true,"claims":{"subject":"u3","email":{"address":"admin@x.io","is_verified":false}}}`)
 		case c != nil && c.Value == "bob":
 			io.WriteString(w, `{"is_valid":true,"claims":{"subject":"u2","username":"bob"}}`)
+		case c != nil && c.Value == "orgadmin":
+			io.WriteString(w, `{"is_valid":true,"claims":{"subject":"u4","username":"carol"},"organizations":[{"id":"o1","name":"Staff","roles":["admin"]}]}`)
+		case c != nil && c.Value == "orgmember":
+			io.WriteString(w, `{"is_valid":true,"claims":{"subject":"u5","username":"dave"},"organizations":[{"id":"o1","name":"Staff","roles":["viewer"]}]}`)
 		default:
 			io.WriteString(w, `{"is_valid":false}`)
 		}
@@ -39,7 +43,7 @@ func TestFrontend(t *testing.T) {
 	http.DefaultTransport = rt{http.HandlerFunc(fake)}
 	admin, _ := ParseUpstream("a", "http://admin.test")
 	pub, _ := ParseUpstream("p", "http://public.test")
-	h := Handler(Options{Admin: admin, Public: pub, Token: "tok", Admins: []string{"admin@x.io"}})
+	h := Handler(Options{Admin: admin, Public: pub, Token: "tok", AdminAccess: AccessRule{Users: []string{"admin@x.io"}, Organization: "Staff", Roles: []string{"admin"}}})
 	do := func(method, path, cookie string, hdr ...string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(method, path, nil)
 		if cookie != "" {
@@ -76,10 +80,15 @@ func TestFrontend(t *testing.T) {
 	check("signin page", do("GET", "/signin?next=/admin/", ""), 200, "hanko-auth")
 	check("signin when signed in", do("GET", "/signin?next=/admin/", "bob"), 302, "loc=/admin/")
 	check("signin open redirect", do("GET", "/signin?next=//evil.com", "bob"), 302, "loc=/")
-	if l := do("GET", "/signin?next=//evil.com", "bob").Header().Get("Location"); l != "/" {
-		t.Errorf("open redirect: %q", l)
+	for _, next := range []string{"//evil.com", "/%09/evil.com", "/%0d/evil.com", "/%5C/evil.com", "/%5C%5Cevil.com", "https://evil.com"} {
+		if l := do("GET", "/signin?next="+next, "bob").Header().Get("Location"); l != "/" {
+			t.Errorf("open redirect via %s: %q", next, l)
+		}
 	}
 	check("public passthrough keeps cookie", do("POST", "/login", "admin"), 200, "public.test/login|auth=|cookie=hanko=admin")
 	check("old /api not exposed", do("GET", "/api/users", "admin"), 200, "public.test/api/users")
 	check("unknown admin path", do("GET", "/admin/nope", "admin"), 404, "")
+	check("org admin role allowed", do("GET", "/admin/", "orgadmin"), 200, "<title>Hanko Admin")
+	check("org member without role denied", do("GET", "/admin/", "orgmember"), 403, "dave")
+	check("session json has organizations", do("GET", "/admin/session", "orgadmin"), 200, `"roles":["admin"]`)
 }

@@ -1,4 +1,4 @@
-# Runs hankoid (public :8000, admin :8001, frontend :8080) against Postgres.
+# Runs hankoid (public :8000, frontend :8080; the admin API stays on loopback inside the container) against Postgres.
 #   docker compose up --build
 # Then register at http://localhost:8080/signin with an address listed in ADMINS (the
 # passcode email lands in Mailpit at http://localhost:8025) and open http://localhost:8080/admin/.
@@ -7,6 +7,7 @@ name: hankoid
 x-hanko-env: &hanko-env
   DATABASE_HOST: postgres
   DATABASE_PASSWORD: "${POSTGRES_PASSWORD:-hanko}"
+  # Local default only. Set a strong value (≥32 chars) when ORIGIN isn't localhost; the OIDC provider rejects this placeholder.
   SECRETS_KEYS: "${SECRETS_KEYS:-change-me-local-dev-secret-key-0123456789}"
   WEBAUTHN_RELYING_PARTY_ID: "${RP_ID:-localhost}"
   WEBAUTHN_RELYING_PARTY_ORIGINS: "${ORIGIN:-http://localhost:8080}"
@@ -14,6 +15,12 @@ x-hanko-env: &hanko-env
   # Plain-http local setup; set to true behind TLS.
   SESSION_COOKIE_SECURE: "${COOKIE_SECURE:-false}"
   SERVER_FRONTEND_ADMINS: "${ADMINS:-admin@example.com}"
+  SERVER_FRONTEND_TRUSTED_PROXIES: "${TRUSTED_PROXIES:-}"
+  SERVER_FRONTEND_PUBLIC_URL: "${ORIGIN:-http://localhost:8080}"
+  # Lax so the session cookie reaches /oidc/authorize on redirects from OIDC clients.
+  SESSION_COOKIE_SAME_SITE: "${COOKIE_SAME_SITE:-lax}"
+  # PEM for the OIDC provider; without it a temporary key is generated on each start.
+  OIDC_SIGNING_KEY: "${OIDC_SIGNING_KEY:-}"
   # Passcode emails go to Mailpit (web inbox at http://localhost:8025). Point at real SMTP elsewhere.
   EMAIL_DELIVERY_SMTP_HOST: "${SMTP_HOST:-mailpit}"
   EMAIL_DELIVERY_SMTP_PORT: "${SMTP_PORT:-1025}"
@@ -59,7 +66,6 @@ services:
     environment: *hanko-env
     ports:
       - "127.0.0.1:8000:8000"
-      - "127.0.0.1:8001:8001"
       - "127.0.0.1:8080:8080"
     depends_on:
       migrate:

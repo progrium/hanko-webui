@@ -5,6 +5,7 @@
 package frontend
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -26,8 +27,15 @@ type Options struct {
 	Public *url.URL
 	// Token, if set, is sent upstream as the admin API bearer token.
 	Token string
-	// Admins lists the users allowed into /admin, by user ID, username, or verified email.
-	Admins []string
+	// AdminAccess decides who may use /admin. An empty rule denies everyone.
+	AdminAccess AccessRule
+	// Extra mounts additional handlers on the frontend mux, keyed by ServeMux pattern
+	// (e.g. "/oidc/"). They get the same live-reload wrapping as built-in routes.
+	Extra map[string]http.Handler
+	// Labelers name sign-in destinations for the /signin page ("Sign in to continue to …").
+	Labelers []NextLabeler
+	// Proxies are trusted reverse proxies, for finding the client IP shown on /signin.
+	Proxies Proxies
 }
 
 // ParseUpstream validates an upstream http(s) URL without query, fragment, or credentials.
@@ -40,8 +48,10 @@ func ParseUpstream(name, raw string) (*url.URL, error) {
 }
 
 const (
-	adminCSP  = "default-src 'none'; script-src 'self' 'unsafe-inline' https://unpkg.com; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
-	signinCSP = "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'"
+	// Scripts come only from this origin (/assets/ is vendored, not a CDN). Inline scripts remain
+	// for the pages' own code. img-src is limited to self/data so injected markup can't exfiltrate.
+	adminCSP  = "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+	signinCSP = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
 )
 
 func securityHeaders(w http.ResponseWriter, csp string) {
@@ -70,7 +80,7 @@ func servePage(name, csp string) http.Handler {
 //	everything else is forwarded to the Hanko public API (which hanko-elements calls same-origin)
 func Handler(opts Options) http.Handler {
 	target, publicTarget, token := opts.Admin, opts.Public, opts.Token
-	auth := NewAuth(publicTarget, opts.Admins)
+	auth := NewAuth(publicTarget, opts.AdminAccess)
 	adminAPI := &httputil.ReverseProxy{
 		Rewrite: func(p *httputil.ProxyRequest) {
 			p.Out.URL.Path = strings.TrimPrefix(p.In.URL.Path, "/admin/api")
@@ -124,19 +134,48 @@ func Handler(opts Options) http.Handler {
 		r.Body = http.MaxBytesReader(w, r.Body, 2<<20)
 		adminAPI.ServeHTTP(w, r)
 	})
-	signinPage := servePage("signin.html", signinCSP)
+	labelNext := func(next string) string {
+		for _, l := range opts.Labelers {
+			if label := l(next); label != "" {
+				return label
+			}
+		}
+		return ""
+	}
 
 	mux := http.NewServeMux()
 	mux.Handle("GET /signin", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Already signed in: skip straight to the destination.
-		if next := r.URL.Query().Get("next"); next != "" {
+		q := r.URL.Query()
+		next := q.Get("next")
+		// Already signed in: skip straight to the destination, unless re-authentication was asked
+		// for (fresh=1), in which case the form is shown and a new sign-in replaces the session.
+		if next != "" && q.Get("fresh") != "1" {
 			if s, err := auth.Session(r); err == nil && s != nil {
 				http.Redirect(w, r, safeNext(next), http.StatusFound)
 				return
 			}
 		}
-		signinPage.ServeHTTP(w, r)
+		// The page shows ?to= as the destination; only the server may set it, from a known label.
+		label := ""
+		if next != "" {
+			label = labelNext(safeNext(next))
+		}
+		if q.Get("to") != label {
+			if label == "" {
+				q.Del("to")
+			} else {
+				q.Set("to", label)
+			}
+			http.Redirect(w, r, "/signin?"+q.Encode(), http.StatusFound)
+			return
+		}
+		// The client's IP, as the server sees it, is shown faintly on the page (useful when
+		// setting up IP allowlists). It's a parsed IP, so it needs no further escaping.
+		securityHeaders(w, signinCSP)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write(bytes.Replace(webui.Page("signin.html"), []byte("<!--client-ip-->"), []byte(opts.Proxies.ClientIP(r)), 1))
 	}))
+	mux.Handle("GET /assets/", http.StripPrefix("/assets/", webui.Assets()))
 	mux.Handle("GET /admin", http.RedirectHandler("/admin/", http.StatusMovedPermanently))
 	mux.Handle("GET /admin/{$}", auth.RequireAdmin(servePage("admin.html", adminCSP), false))
 	mux.Handle("GET /admin/session", auth.RequireAdmin(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -146,6 +185,9 @@ func Handler(opts Options) http.Handler {
 	}), true))
 	mux.Handle("/admin/api/", auth.RequireAdmin(apiGuard, true))
 	mux.Handle("/admin/", http.NotFoundHandler())
+	for pattern, h := range opts.Extra {
+		mux.Handle(pattern, h)
+	}
 	mux.Handle("/", publicProxy)
 	return webui.Reload(mux)
 }
@@ -160,35 +202,55 @@ type Addrs struct {
 	Listen, Admin, Public string
 }
 
-// Serve loads server addresses from the Hanko config file, applies overrides, and serves the frontend.
-// HANKO_ADMIN_TOKEN sets the upstream admin API bearer token.
-func Serve(configFile string, override Addrs) error {
-	sc, err := LoadServerConfig(configFile)
-	if err != nil {
-		return err
-	}
+// Upstreams are the resolved frontend listen address and Hanko API URLs.
+type Upstreams struct {
+	Listen string
+	Admin  *url.URL
+	Public *url.URL
+}
+
+// Resolve applies overrides to the config's addresses and validates the upstream URLs.
+func (c Config) Resolve(override Addrs) (Upstreams, error) {
 	listen, adminRaw, publicRaw := override.Listen, override.Admin, override.Public
 	if listen == "" {
-		listen = sc.Frontend
+		listen = c.Frontend
 	}
 	if adminRaw == "" {
-		adminRaw = AddrURL(sc.Admin)
+		adminRaw = AddrURL(c.Admin)
 	}
 	if publicRaw == "" {
-		publicRaw = AddrURL(sc.Public)
+		publicRaw = AddrURL(c.Public)
 	}
 	adminURL, err := ParseUpstream("admin", adminRaw)
 	if err != nil {
-		return err
+		return Upstreams{}, err
 	}
 	publicURL, err := ParseUpstream("public", publicRaw)
 	if err != nil {
+		return Upstreams{}, err
+	}
+	return Upstreams{Listen: listen, Admin: adminURL, Public: publicURL}, nil
+}
+
+// Serve serves the frontend with the given config and upstreams. extra mounts additional
+// handlers (see Options.Extra). HANKO_ADMIN_TOKEN sets the upstream admin API bearer token.
+func Serve(cfg Config, up Upstreams, extra map[string]http.Handler, labelers ...NextLabeler) error {
+	proxies, err := ParseProxies(cfg.TrustedProxies)
+	if err != nil {
 		return err
 	}
-	h := Handler(Options{Admin: adminURL, Public: publicURL, Token: os.Getenv("HANKO_ADMIN_TOKEN"), Admins: sc.Admins})
-	if len(sc.Admins) == 0 {
-		log.Printf("frontend: no admins configured (server.frontend.admins); /admin will deny everyone")
+	h := Handler(Options{Admin: up.Admin, Public: up.Public, Token: AdminToken(), AdminAccess: cfg.AdminAccess, Extra: extra, Labelers: labelers, Proxies: proxies})
+	if cfg.AdminAccess.Empty() {
+		log.Printf("frontend: no admin access configured (server.frontend.admin_access); /admin will deny everyone")
 	}
-	log.Printf("frontend: http://%s (admin %s, public %s)", listen, adminURL, publicURL)
-	return NewServer(listen, h).ListenAndServe()
+	for _, w := range cfg.Warnings() {
+		log.Printf("frontend: WARNING: %s", w)
+	}
+	log.Printf("frontend: %s, listening on %s (admin %s, public %s)", cfg.PublicURL, up.Listen, up.Admin, up.Public)
+	return NewServer(up.Listen, h).ListenAndServe()
+}
+
+// AdminToken is the Hanko admin API bearer token from HANKO_ADMIN_TOKEN.
+func AdminToken() string {
+	return os.Getenv("HANKO_ADMIN_TOKEN")
 }

@@ -35,6 +35,11 @@ func Page(name string) []byte {
 	return append(b, reloadScript...)
 }
 
+// Assets serves the vendored scripts from webui/vendor on disk.
+func Assets() http.Handler {
+	return assetHandler(http.Dir(filepath.Join(srcDir, "vendor")))
+}
+
 func lastModified() time.Time {
 	var latest time.Time
 	for _, glob := range watchGlobs {

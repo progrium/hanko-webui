@@ -13,6 +13,8 @@ header{background:#17243b;color:white}
 main{flex:1;display:flex;align-items:flex-start;justify-content:center;padding:48px 16px}
 .card{width:min(420px,100%);background:white;border:1px solid #dbe1ea;border-radius:9px;padding:8px 8px 4px}
 .note{max-width:420px;margin:14px auto 0;color:#6d788c;text-align:center}
+.client-ip{position:fixed;right:12px;bottom:8px;margin:0;color:#c3cad6;font-size:11px;font-variant-numeric:tabular-nums}
+.client-ip:empty{display:none}
 .error{padding:12px;background:#fff0f0;color:#a32239;border-radius:6px;margin:12px}
 hanko-auth{
   --font-family:system-ui;--color:#263248;--color-shade-1:#6d788c;--color-shade-2:#cbd3df;
@@ -29,15 +31,25 @@ hanko-auth{
     <p class="note" id="note"></p>
   </div>
 </main>
+<p class="client-ip" title="Your IP address, as seen by this server"><!--client-ip--></p>
 <script type="module">
   // The frontend forwards Hanko public API routes, so the API lives on this origin.
   const next = (() => {
     const n = new URLSearchParams(location.search).get("next") || "/";
-    return n.startsWith("/") && !n.startsWith("//") && !n.startsWith("/\\") ? n : "/";
+    // Same rule as the server's safeNext: a same-origin path with no control characters or
+    // backslashes, which browsers strip or rewrite (e.g. "/\t/evil.com" resolves to "//evil.com").
+    return n.startsWith("/") && !n.startsWith("//") && !/[\u0000-\u001f\u007f\\]/.test(n) ? n : "/";
   })();
-  if (next !== "/") document.getElementById("note").textContent = "Sign in to continue to " + next;
+  const to = new URLSearchParams(location.search).get("to");
+  if (to) document.getElementById("note").textContent = "Sign in to continue to " + to;
+  else if (next.startsWith("/admin")) document.getElementById("note").textContent = "Sign in to continue to Hanko Admin";
   try {
-    const { register } = await import("https://cdn.jsdelivr.net/npm/@teamhanko/hanko-elements/dist/elements.js");
+    const { register } = await import("/assets/hanko-elements-3.1.0.js");
+    const params = new URLSearchParams(location.search);
+    if (params.get("fresh") === "1") {
+      // Re-authentication: the current session must be replaced by a new sign-in.
+      await fetch("/logout", { method: "POST", credentials: "same-origin" }).catch(() => {});
+    }
     const { hanko } = await register(location.origin);
     hanko.onSessionCreated(() => location.replace(next));
   } catch (e) {

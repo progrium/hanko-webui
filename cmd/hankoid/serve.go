@@ -22,9 +22,26 @@ func registerFrontendFlags(cmd *cobra.Command, a *frontend.Addrs) {
 	cmd.Flags().StringVar(&a.Public, "frontend-public", "", "public API URL for the frontend (default: from server.public.address)")
 }
 
+// startFrontend loads the frontend and OIDC provider config and serves the frontend.
 func startFrontend(configFile string, a frontend.Addrs, wg *sync.WaitGroup) {
 	defer wg.Done()
-	log.Fatal(frontend.Serve(configFile, a))
+	cfg, err := frontend.LoadConfig(configFile)
+	if err != nil {
+		log.Fatal(err)
+	}
+	up, err := cfg.Resolve(a)
+	if err != nil {
+		log.Fatal(err)
+	}
+	extra, label, err := oidcHandlers(cfg, up)
+	if err != nil {
+		log.Fatal(err)
+	}
+	var labelers []frontend.NextLabeler
+	if label != nil {
+		labelers = append(labelers, label)
+	}
+	log.Fatal(frontend.Serve(cfg, up, extra, labelers...))
 }
 
 func newServeFrontendCommand() *cobra.Command {
@@ -37,12 +54,12 @@ func newServeFrontendCommand() *cobra.Command {
 		Short: "Start the frontend (sign-in page and admin UI), proxying to a running admin and public server",
 		Long: `Start the frontend, proxying to a running admin and public server.
 
-Routes: /signin (Hanko sign-in), /admin/ (admin UI, limited to server.frontend.admins),
-/admin/api/* (admin API proxy), and everything else to the public API.
+Routes: /signin (Hanko sign-in), /admin/ (admin UI, limited by server.frontend.admin_access),
+/admin/api/* (admin API proxy), /oidc/* (OIDC provider, when oidc.clients is configured),
+and everything else to the public API.
 
-Only the server section of the config is read (server.public.address,
-server.admin.address, server.frontend.address, server.frontend.admins), so the
-database and secrets need not be configured.`,
+Only the server, session.cookie, secrets.keys, and oidc sections of the config are read,
+so the database need not be configured.`,
 		Run: func(cmd *cobra.Command, args []string) {
 			var wg sync.WaitGroup
 			wg.Add(1)

@@ -1,6 +1,8 @@
 # OIDC provider in the frontend: plan
 
-Goal: let listmonk (and other OIDC clients) sign users in with Hanko. Hanko stays unmodified. The provider is a new `oidc` package mounted by the frontend, next to `/signin` and `/admin/`.
+> **Status:** implemented. This is the design record; for running it, see [README.md](./README.md) and the [main README](../README.md#oidc-provider). Implemented in `oidc/`, `frontend/access.go`, `frontend/adminapi.go`, and `cmd/hankoid/oidc*.go`. Tests are in `oidc/provider_test.go` (an end-to-end run with go-oidc + oauth2, plus edge cases) and `frontend/*_test.go`. Deviations from the plan are noted below, and in "Security hardening" at the end.
+
+Goal: let OIDC clients (relying parties) sign users in with Hanko. Hanko stays unmodified. The provider is a new `oidc` package mounted by the frontend, next to `/signin` and `/admin/`.
 
 ## Why the frontend, not a Hanko fork
 
@@ -26,16 +28,16 @@ That covers almost everything the provider needs from Hanko, without forking:
 
 The upstream code needs no changes and no new database tables, so updating Hanko stays as easy as bumping the module version.
 
-## What listmonk needs
+## What a typical client needs
 
-Listmonk (`internal/auth/auth.go`) uses `coreos/go-oidc/v3` with the authorization-code flow. That library is already in our `go.sum`, as an indirect dependency of Hanko's own SSO. Listmonk needs:
+The baseline is a confidential web app using the authorization-code flow with a standard library such as `coreos/go-oidc/v3`. That library is already in our `go.sum`, as an indirect dependency of Hanko's own SSO.
 
-- **Discovery** at `{issuer}/.well-known/openid-configuration`. The `issuer` must exactly match the URL configured in listmonk.
-- **Authorize** with `state` and `nonce`, plus PKCE `S256` if discovery advertises it, so we advertise and support it.
+- **Discovery** at `{issuer}/.well-known/openid-configuration`. The `issuer` must exactly match the URL configured in the client.
+- **Authorize** with `state` and `nonce`, plus PKCE `S256` when discovery advertises it, so we advertise and support it.
 - **Token**: an `id_token` signed RS256, with `aud = client_id`, the `nonce`, `sub`, `email` and `email_verified`.
-- **Userinfo**: only called when `email`/`email_verified` are missing from the ID token. We always include them, but implement userinfo anyway.
+- **Userinfo**: some clients only call it when claims are missing from the ID token. We always include the core claims, but implement userinfo anyway.
 - **End session** (optional): `end_session_endpoint` with `id_token_hint`.
-- Listmonk matches users **by email**. It only creates missing users when `auto_create_users` is on.
+- Clients commonly match users **by email**, so `email_verified` must be accurate.
 
 ## 1. Routes and issuer
 
@@ -93,16 +95,16 @@ oidc:
   id_token_ttl: 5m
   access_token_ttl: 5m
   clients:
-    - id: listmonk
-      name: Listmonk                           # shown on the sign-in page
+    - id: myapp
+      name: My App                             # shown on the sign-in page
       secret: ""                               # or secret_hash (bcrypt); see env below
-      redirect_uris: [https://lists.example.com/auth/oidc]
-      post_logout_redirect_uris: [https://lists.example.com/admin/login]
+      redirect_uris: [https://app.example.com/auth/callback]
+      post_logout_redirect_uris: [https://app.example.com/]
       scopes: [openid, email, profile]
       require_pkce: false
       access:                                  # who may sign in; see §2a
         users: [alice@example.com]             # static list (IDs, usernames, verified emails)
-        organization: listmonk                 # and/or members of a Hanko organization
+        organization: myapp                    # and/or members of a Hanko organization
         roles: []                              # empty = any member
       roles_claim: false                       # emit "roles" (slugs in access.organization); see §2b
 ```
@@ -118,7 +120,7 @@ The provider is enabled when `oidc.clients` is non-empty. There's no separate `e
 - **Environment overrides:**
   - `SERVER_FRONTEND_PUBLIC_URL`
   - `OIDC_SIGNING_KEY` (the PEM itself)
-  - `OIDC_CLIENTS_<ID>_SECRET`, e.g. `OIDC_CLIENTS_LISTMONK_SECRET`, so secrets stay out of the file and compose can pass them in. These follow Hanko's own naming (the key path, uppercased with `_`), so they look like Hanko's `SECRETS_KEYS` or `DATABASE_PASSWORD`.
+  - `OIDC_CLIENTS_<ID>_SECRET`, e.g. `OIDC_CLIENTS_MYAPP_SECRET`, so secrets stay out of the file and compose can pass them in. These follow Hanko's own naming (the key path, uppercased with `_`), so they look like Hanko's `SECRETS_KEYS` or `DATABASE_PASSWORD`.
 - **Validation** at startup:
   - `public_url` is absolute and HTTPS, except `http://localhost` / `127.0.0.1` for dev, with no path, query or fragment.
   - Each client has a unique ID, a non-empty secret or secret hash, and at least one absolute redirect URI.
@@ -134,19 +136,19 @@ Each client has an optional `access` block with two kinds of rules, usable separ
 ```yaml
 oidc:
   clients:
-    - id: listmonk
+    - id: myapp
       access:
         users:                       # static list, matched like server.frontend.admins
           - alice@example.com        # verified email
           - bob                      # username
           - 3c2ad943-586a-4adc-b633-29a00c8bdb56   # user ID
-        organization: listmonk       # Hanko organization, by name or ID
+        organization: myapp          # Hanko organization, by ID or exact name
         roles: [admin, editor]       # optional; empty = any member of the organization
 ```
 
 - **Semantics:**
   - A user is allowed if they match `users` **or** satisfy the organization rule.
-  - With no `access` block, any Hanko user may sign in. Startup logs that, so it's never an accident.
+  - The `access` block is **required** (security pass 2). `any_user: true` admits every Hanko user, explicitly, and startup logs it. It can't be combined with `users`/`organization`.
   - With `access` present but empty, nobody may, mirroring `admins: []`.
 - **Static list (`users`):**
   - Entries are user IDs, usernames or **verified** emails, case-insensitive. This is exactly the matching `server.frontend.admins` uses; extract it from `Auth.IsAdmin` into a shared `matchUser(entries, session)`.
@@ -159,7 +161,7 @@ oidc:
   - The client config holds the rule above, and nothing else.
   - `frontend.Session` gains `Organizations []{ID, Name, Roles}` from the validate response.
   - The `oidc` package evaluates the rule at authorize (`error=access_denied` if it fails) and again at token time, when the session-alive check re-validates the session.
-  - Listmonk needs no access rules of its own. Inside listmonk, the role a user gets comes from `auto_create_users` + "default role", or is set manually (see §2b).
+  - The client needs no access rules of its own. What the user may do inside the client stays the client's business, unless it maps the roles claim (§2b).
 
 **`/admin` uses the same rule shape.** `server.frontend.admin_access` has the same `{users, organization, roles}` shape as a client's `access`:
 
@@ -176,11 +178,11 @@ server:
 - **Compatibility:** the existing `server.frontend.admins` and `SERVER_FRONTEND_ADMINS` stay as aliases for `admin_access.users`. If both are set, the lists are merged.
 - **Differences from clients:**
   - For `/admin`, a missing or empty rule denies everyone, with a startup warning, as today. Admin access must never be open by default.
-  - For OIDC clients, a missing `access` block means any Hanko user.
+  - For OIDC clients, a missing `access` block is a config error; open clients must say `any_user: true`. `/admin` rejects `any_user`.
 - **Shared code:** a new `frontend/access.go` defines `AccessRule{Users, Organization, Roles}` with `Allows(*Session) bool`.
   - `Auth.IsAdmin` becomes `adminRule.Allows(s)`, and the `oidc` package uses the same type for clients.
   - `oidc` imports it from `frontend`, so `frontend` must not import `oidc` (see §5).
-  - Matching `organization`: compare against the organization ID, or case-insensitively against its name. `/sessions/validate` returns `id` and `name` but no slug, so "by slug" means by name.
+  - Matching `organization`: compare against the organization ID, or exactly against its name (case-insensitive name matching was dropped in the security review). `/sessions/validate` returns `id` and `name` but no slug, so "by slug" means by name.
 
 ### 2b. A `roles` claim
 
@@ -218,7 +220,7 @@ oidc:
   - an `organization` claim.
   - Each is additive; e.g. `roles_claim: true` can later become `roles_claim: {name: groups, map: {…}}` with `true` still meaning the defaults.
 
-**Listmonk specifically.** As far as I know, listmonk's OIDC login doesn't map claims to roles. It matches users by email, and auto-created users get the configured default role, so a roles claim would do nothing there today. Check this against the listmonk version you deploy. With listmonk, use `access` to decide *who* gets in, and manage *what they can do* inside listmonk. The claim is for future clients that can map it, such as Grafana or Gitea.
+**Clients that can't map claims** simply ignore `roles`. For them, use `access` to decide *who* gets in, and manage permissions inside the client.
 
 **Cautions:**
 - **Trust:** a roles claim grants privileges in the client, so it's only safe if the client checks `iss` and `aud`. That's one more reason to keep ID tokens off Hanko's session key (§3).
@@ -229,7 +231,7 @@ oidc:
 
 The operator must set these Hanko session settings. They are checked at startup by reading the `session.cookie` section of the same config:
 
-- `session.cookie.same_site: lax`. The default `strict` cookie isn't sent on the cross-site top-level navigation from listmonk to `/oidc/authorize`, so the user would always look logged out. Log a warning if it's `strict`.
+- `session.cookie.same_site: lax`. The default `strict` cookie isn't sent on the cross-site top-level navigation from the client to `/oidc/authorize`, so the user would always look logged out. Log a warning if it's `strict`.
 - Cookie mode, not `session.enable_auth_token_header`; a browser redirect only carries cookies.
 - `session.cookie.domain` can usually stay unset. `/signin`, `/oidc/*` and the proxied Hanko API are all served by the frontend, so it's one origin.
 
@@ -241,7 +243,7 @@ The operator must set these Hanko session settings. They are checked at startup 
 - If no key is configured, `hankoid` generates one on startup and logs a warning that tokens won't verify across restarts or replicas. That's fine for dev only.
 - **Why a provider-owned key rather than Hanko's JWK set:**
   - *No database or Hanko internals in `serve frontend`.* Hanko keeps its private keys encrypted in its `jwks` table and only unseals them inside the server, via the JWK manager and `secrets.keys`. Signing with them would mean `serve frontend` opens the database and depends on Hanko's internal key manager API, which can change between Hanko releases, and the AWS KMS mode works differently again. Today `serve frontend` needs only the `server` section of the config.
-  - *Different token types under one key are a confusion risk.* Hanko session JWTs and our ID tokens would be signed by the same key and published in the same JWKS, and apps that accept Hanko session tokens look up keys in that JWKS. An ID token issued to listmonk, with `aud=listmonk`, would also verify against it. A Hanko-session consumer that doesn't strictly check `aud`/`iss` could then accept an ID token as a session, or the reverse. Separate keys and a separate JWKS (`/oidc/jwks.json`) remove that whole class of mistake.
+  - *Different token types under one key are a confusion risk.* Hanko session JWTs and our ID tokens would be signed by the same key and published in the same JWKS, and apps that accept Hanko session tokens look up keys in that JWKS. An ID token issued to a client, with `aud=<client_id>`, would also verify against it. A Hanko-session consumer that doesn't strictly check `aud`/`iss` could then accept an ID token as a session, or the reverse. Separate keys and a separate JWKS (`/oidc/jwks.json`) remove that whole class of mistake.
   - *Independent lifecycle.* Rotating, revoking or leaking the OIDC key doesn't touch Hanko sessions, and the other way round.
   - *Nothing gained by sharing.* OIDC clients only ever fetch the key from our discovery document. No client needs it to be Hanko's.
   - Revisit only if a consumer must verify Hanko session tokens and ID tokens with one JWKS URL.
@@ -327,7 +329,7 @@ CREATE INDEX ON hankoid.oidc_access_tokens (session_id);
 - A JWT signed with the provider key.
 - Claims: `iss`, `sub`, `aud = {issuer}/userinfo`, `client_id`, `scope`, `sid`, `exp` (5 minutes), and `jti`.
 - At userinfo: verify the token, check `SessionAlive`, then read the user fresh from the admin API.
-- **No refresh tokens;** listmonk doesn't use them.
+- **No refresh tokens** in the first version; typical web-app clients sign in again when their own session ends.
 
 ## 4. Endpoints in detail
 
@@ -353,7 +355,7 @@ CREATE INDEX ON hankoid.oidc_access_tokens (session_id);
 2. Look up the session with `Hanko.Session(r)`, the existing cookie-forwarding validation.
 3. If there's no session, or `prompt=login`, or the session is older than `max_age`, redirect to `/signin?next=<this authorize URL>`.
    - The existing `safeNext` already blocks open redirects, since only same-origin paths are allowed.
-   - For `prompt=login`, sign out first (via `Hanko.Logout`), then redirect with `prompt` removed, so it doesn't loop.
+   - For `prompt=login`, redirect with `prompt` removed, so it doesn't loop. (Built differently: no sign-out on GET; see "Security hardening".)
    - `prompt=none` with no session → `error=login_required`.
 4. If the client has an `access` block and the user matches neither its `users` list nor its organization rule (§2a) → `error=access_denied`.
 5. Seal a code and redirect with 302 to `redirect_uri?code=…&state=…`.
@@ -409,13 +411,11 @@ oidc/
 - New `access.go` with `AccessRule`; `Auth.IsAdmin` delegates to it.
 - `Session` gains `SessionID` and `Organizations` (from `/sessions/validate`).
 - Admin-API helpers move out of the proxy closure into small methods: `getJSON(path)` and `delete(path)` with the bearer token.
-- The default sign-in page stays generic. When `next` is an `/oidc/authorize` URL, add the client name ("Sign in to continue to Listmonk") by reading the client ID from `next`.
+- The default sign-in page stays generic. When `next` is an `/oidc/authorize` URL, add the client name ("Sign in to continue to My App", from the client's `name`) by reading the client ID from `next`.
 
 **`hankoid`:** no new flags. `serve frontend` and `serve all` pick up the top-level `oidc` key automatically.
 
-**Local dev and compose:**
-- Add a `listmonk` service to `compose.yaml` behind a profile (`docker compose --profile listmonk up`).
-- Set `OIDC_LISTMONK_SECRET`, and in `.local/hanko.yaml`, add a `listmonk` client with redirect `http://localhost:9000/auth/oidc` and set `session.cookie.same_site: lax`.
+**Local dev:** a real client setup for manual testing lives outside this plan (e.g. `.local/LISTMONK.md`).
 
 ## 6. Build order
 
@@ -434,21 +434,29 @@ oidc/
    - Table tests: unknown client, bad redirect (no redirect issued), missing `openid`, PKCE mismatch or missing when required, expired code, replayed code, code whose session was deleted, wrong client secret, nonce passthrough, `prompt=none`, a user admitted by `users` only, by organization only, rejected by both, an organization member lacking a required role, and a membership revoked between authorize and token.
    - Roles claim: only the client's organization's roles appear, `[]` for `users`-only admits, omitted when `roles_claim` is off or neither `roles` nor `profile` is requested, and present in both the ID token and userinfo.
    - `/admin` with `admin_access`: admitted via `users`, via organization role, denied for a member without the role; the `admins` alias still works; empty means deny.
-   - End-to-end: a real go-oidc + `oauth2` client (the same libraries listmonk uses) against `httptest` servers for the fake Hanko and the frontend. It follows redirects with a cookie jar through authorize → `/signin` → (fake session) → authorize → callback → token, then verifies the ID token with go-oidc and calls userinfo.
-10. **Listmonk:** Settings → Security → OIDC.
-   - Provider URL = issuer, `{public_url}/oidc`, e.g. `http://localhost:8080/oidc` in dev.
-   - Either list users in `access.users`, or create organization `listmonk` in the admin UI, add members and set `access.organization: listmonk`.
-   - Client ID `listmonk` and the secret; redirect `https://<listmonk>/auth/oidc`.
-   - Optionally enable auto-create users and set a default role.
-   - Verify with the compose profile.
+   - End-to-end: a real go-oidc + `oauth2` client (the libraries typical Go clients use) against `httptest` servers for the fake Hanko and the frontend. It follows redirects with a cookie jar through authorize → `/signin` → (fake session) → authorize → callback → token, then verifies the ID token with go-oidc and calls userinfo.
+10. **Manual check with a real client** (see `.local/LISTMONK.md`).
 11. **Docs:** README "OIDC provider" section with a config example and the cookie `same_site: lax` requirement. Update "Admin access" for `admin_access`, including the bootstrap steps.
+
+## Implementation notes
+
+- **Sign-in label:** the client name reaches `/signin` as a server-set `?to=` parameter.
+  - `frontend.Options.Labelers` lets `oidc` name an `/oidc/authorize` destination.
+  - `/signin` redirects to set or correct `to`, so a link can't spoof it.
+  - For `/admin` destinations, the page shows "Hanko Admin".
+- **Callback `iss`:** authorize also adds `iss` to the callback (RFC 9207, mix-up protection). Clients that don't know it ignore it.
+- **Roles source:** the roles claim and organization access at token and userinfo time come from the admin API user record, which includes organizations and role slugs. At authorize time they come from `/sessions/validate`.
+- **Rate limit:** 10-request burst, refilling at 1/s, per peer IP and per client, in memory.
+- **`oidc genkey`:** a new CLI command. `.local/dev` uses it to create `.local/oidc-signing.pem` on first run.
+- **Config loading:** `frontend.Config` carries the raw file and its directory. `oidc.LoadConfig(raw, publicURL, dir)` reads the top-level `oidc` key, and relative key paths resolve against the config file's directory.
+- **Upgrade guard:** `TestHankoConfigHasNoOIDCKey` fails if Hanko's config struct gains a top-level `oidc` key.
 
 ## Decisions
 
 - **Deployment:** single instance, no replicas. Codes use sealed blobs plus an in-memory replay set. The Postgres store above is documented for later and not built now.
 - **Signing key:** provider-owned (rationale in §3). Configure it with `oidc.signing_key_file` or `OIDC_SIGNING_KEY`; it's generated on startup only for dev.
 - **Config location:** a top-level `oidc` key in the Hanko config file. `server.frontend` keeps `address` and `public_url`.
-- **Access:** per-client `access` with a static `users` list and/or an organization rule (`organization` + `roles`). Either rule admits the user; with no `access` block, any Hanko user may sign in.
+- **Access:** per-client `access` with a static `users` list and/or an organization rule (`organization` + `roles`). Either rule admits the user. `access` is required; `any_user: true` opens a client to every Hanko user (changed in the security review).
 - **Public URL:** a new `server.frontend.public_url`; the issuer is `{public_url}/oidc`.
 - **Admin access:** `/admin` uses the same rule shape, as `server.frontend.admin_access`. The static `users` list bootstraps, organization and roles are optional, and `admins` stays as an alias. An empty rule denies.
 - **Roles claim:** minimal version, a per-client `roles_claim: true` that emits `roles` with slugs from `access.organization`. Name mapping, value mapping and static roles are deferred.
@@ -456,3 +464,20 @@ oidc/
 ## Open questions
 
 - None blocking. Revisit the deferred roles-claim options when a client that maps roles is added.
+
+## Security hardening (second review)
+
+Changes made after a security review of this repo's code:
+
+- **Scripts are vendored.** hanko-elements and Mithril are served from `/assets/` (embedded, hash-checked by a test) instead of a CDN. The CSPs allow only `'self'` scripts, so a compromised CDN can't steal sessions on `/signin` or `/admin`.
+- **The Hanko admin API stays on loopback.** It has no authentication; `deploy/config.yaml` binds it to `127.0.0.1:8001`, the image no longer exposes 8001, and the frontend warns at startup when it isn't loopback.
+- **Logout CSRF.** `GET /oidc/logout` signs out only with a valid `id_token_hint`. Without one it shows a confirmation page; the sign-out is a `POST` that must be same-origin (`Origin` or `Sec-Fetch-Site`) and carry a double-submit token (`hankoid_logout` cookie, SameSite=Strict).
+- **`id_token_hint` validation.** It must be one of our ID tokens: valid signature and issuer, not an access token (`typ: at+jwt`), a single audience that is a configured client (matching `client_id` if given), and issued within 30 days. Expired hints are accepted, per the spec.
+- **No sign-out on `prompt=login` / `max_age`.** Instead of logging out on a GET, authorize sends the user to `/signin?fresh=1` and appends `min_auth_time=<now>` to the URL it returns to. Back at authorize, a session whose `auth_time` is older is rejected with `login_required`, so a stale session can't satisfy a forced re-login.
+- **Token typing.** Access tokens carry `typ: at+jwt`; userinfo rejects anything else, so an ID token can't be used as a bearer token.
+- **Access is required per client** (see §2a), with `any_user: true` as the explicit open option. Organization names match exactly (IDs case-insensitively), so a similarly named org can't grant access.
+- **Config checks** for non-localhost issuers: client secrets ≥16 characters, `secrets.keys` ≥32 characters and not a `change-me` placeholder, redirect URIs `https` (or `http` on loopback) without userinfo.
+- **Code key separation.** Codes are sealed with a key derived by HKDF-SHA256 from `secrets.keys` (label `hankoid oidc authorization code v1`), not the raw keys Hanko uses elsewhere.
+- **Rate limiter.** Buckets are keyed per IP and per client; idle buckets are evicted, and when the table is full new keys share an overflow bucket rather than growing memory. `server.frontend.trusted_proxies` (IPs/CIDRs, shared with the rest of the frontend) makes `X-Forwarded-For` count, using the right-most untrusted address.
+- **Cookie warnings.** Startup warns when `public_url` is https but `session.cookie.secure` is false, or when `same_site` is `none`.
+- **Not done:** serving Hanko's public API on the frontend's origin (a "shared origin"), which would let the session cookie be host-only.

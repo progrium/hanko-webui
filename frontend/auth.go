@@ -14,10 +14,20 @@ import (
 
 // Session is the signed-in Hanko user, as reported by the public API's /sessions/validate.
 type Session struct {
-	UserID        string `json:"user_id"`
-	Email         string `json:"email,omitempty"`
-	EmailVerified bool   `json:"email_verified"`
-	Username      string `json:"username,omitempty"`
+	UserID        string         `json:"user_id"`
+	SessionID     string         `json:"session_id,omitempty"`
+	Email         string         `json:"email,omitempty"`
+	EmailVerified bool           `json:"email_verified"`
+	Username      string         `json:"username,omitempty"`
+	IssuedAt      time.Time      `json:"issued_at,omitempty"`
+	Organizations []Organization `json:"organizations,omitempty"`
+}
+
+// Organization is a Hanko organization the user belongs to, with their role slugs in it.
+type Organization struct {
+	ID    string   `json:"id"`
+	Name  string   `json:"name"`
+	Roles []string `json:"roles"`
 }
 
 // Name is the best human-readable identifier for the user.
@@ -31,23 +41,16 @@ func (s *Session) Name() string {
 	return s.UserID
 }
 
-// Auth checks Hanko sessions against an allowlist of admin users.
+// Auth validates Hanko sessions and checks admin access.
 type Auth struct {
 	public *url.URL
-	admins []string
+	admin  AccessRule
 	client *http.Client
 }
 
-// NewAuth validates sessions with the Hanko public API at public. Each admin entry matches a
-// user ID, a username, or a verified email address (case-insensitive).
-func NewAuth(public *url.URL, admins []string) *Auth {
-	var clean []string
-	for _, a := range admins {
-		if a = strings.TrimSpace(a); a != "" {
-			clean = append(clean, a)
-		}
-	}
-	return &Auth{public: public, admins: clean, client: &http.Client{Timeout: 10 * time.Second}}
+// NewAuth validates sessions with the Hanko public API at public and grants /admin according to admin.
+func NewAuth(public *url.URL, admin AccessRule) *Auth {
+	return &Auth{public: public, admin: admin, client: &http.Client{Timeout: 10 * time.Second}}
 }
 
 // Session returns the request's Hanko session, or nil if there is no valid session.
@@ -79,13 +82,16 @@ func (a *Auth) Session(r *http.Request) (*Session, error) {
 	var body struct {
 		IsValid bool `json:"is_valid"`
 		Claims  *struct {
-			Subject string `json:"subject"`
-			Email   *struct {
+			Subject   string     `json:"subject"`
+			SessionID string     `json:"session_id"`
+			IssuedAt  *time.Time `json:"issued_at"`
+			Email     *struct {
 				Address    string `json:"address"`
 				IsVerified bool   `json:"is_verified"`
 			} `json:"email"`
 			Username *string `json:"username"`
 		} `json:"claims"`
+		Organizations []Organization `json:"organizations"`
 	}
 	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
 		return nil, fmt.Errorf("decode session validation: %w", err)
@@ -93,7 +99,10 @@ func (a *Auth) Session(r *http.Request) (*Session, error) {
 	if !body.IsValid || body.Claims == nil || body.Claims.Subject == "" {
 		return nil, nil
 	}
-	s := &Session{UserID: body.Claims.Subject}
+	s := &Session{UserID: body.Claims.Subject, SessionID: body.Claims.SessionID, Organizations: body.Organizations}
+	if body.Claims.IssuedAt != nil {
+		s.IssuedAt = *body.Claims.IssuedAt
+	}
 	if e := body.Claims.Email; e != nil {
 		s.Email, s.EmailVerified = e.Address, e.IsVerified
 	}
@@ -103,22 +112,35 @@ func (a *Auth) Session(r *http.Request) (*Session, error) {
 	return s, nil
 }
 
-// IsAdmin reports whether the session's user is on the allowlist. Emails only match when verified.
+// IsAdmin reports whether the session's user satisfies the admin access rule.
 func (a *Auth) IsAdmin(s *Session) bool {
-	if s == nil {
-		return false
+	return a.admin.Allows(s)
+}
+
+// Logout ends the request's Hanko session by forwarding its cookie to the public API's
+// /logout, and copies Hanko's cookie-clearing Set-Cookie headers onto w.
+func (a *Auth) Logout(w http.ResponseWriter, r *http.Request) error {
+	cookie := r.Header.Get("Cookie")
+	if cookie == "" {
+		return nil
 	}
-	for _, entry := range a.admins {
-		switch {
-		case strings.EqualFold(entry, s.UserID):
-			return true
-		case s.Username != "" && strings.EqualFold(entry, s.Username):
-			return true
-		case s.Email != "" && s.EmailVerified && strings.EqualFold(entry, s.Email):
-			return true
-		}
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, a.public.JoinPath("logout").String(), nil)
+	if err != nil {
+		return err
 	}
-	return false
+	req.Header.Set("Cookie", cookie)
+	res, err := a.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	for _, c := range res.Header.Values("Set-Cookie") {
+		w.Header().Add("Set-Cookie", c)
+	}
+	if res.StatusCode >= 300 && res.StatusCode != http.StatusUnauthorized {
+		return fmt.Errorf("logout returned %s", res.Status)
+	}
+	return nil
 }
 
 // SignInURL is the sign-in page path that returns to next afterwards.
@@ -126,10 +148,21 @@ func SignInURL(next string) string {
 	return "/signin?next=" + url.QueryEscape(next)
 }
 
-// safeNext only allows same-origin absolute paths, preventing open redirects.
+// NextLabeler names a sign-in destination for display, e.g. an OIDC client's name for an
+// /oidc/authorize URL. It returns "" when it doesn't recognize next.
+type NextLabeler func(next string) string
+
+// safeNext only allows same-origin absolute paths, preventing open redirects. Browsers drop
+// tabs and newlines and treat backslashes as slashes when resolving URLs, so any control
+// character or backslash is rejected outright rather than risk "/\t/evil.com" becoming "//evil.com".
 func safeNext(next string) string {
-	if !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") || strings.HasPrefix(next, "/\\") {
+	if !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") {
 		return "/"
+	}
+	for _, c := range next {
+		if c < 0x20 || c == 0x7f || c == '\\' {
+			return "/"
+		}
 	}
 	return next
 }

@@ -1,5 +1,6 @@
 # hankoid config for containers. Secrets and environment-specific values come from env vars
-# (e.g. DATABASE_PASSWORD, SECRETS_KEYS, SERVER_FRONTEND_ADMINS); see compose.yaml.
+# (e.g. DATABASE_PASSWORD, SECRETS_KEYS, SERVER_FRONTEND_ADMINS, SERVER_FRONTEND_PUBLIC_URL,
+# OIDC_SIGNING_KEY, OIDC_CLIENTS_<ID>_SECRET); see compose.yaml.
 database:
   dialect: postgres
   host: postgres
@@ -11,7 +12,12 @@ service:
 server:
   public:
     address: ":8000"
+  # Hanko's admin API has no authentication of its own; keep it on loopback. The frontend reaches
+  # it over 127.0.0.1 and only proxies it to allowed admins.
   admin:
-    address: ":8001"
+    address: "127.0.0.1:8001"
   frontend:
     address: ":8080"
+# OIDC provider: add clients here (secrets via OIDC_CLIENTS_<ID>_SECRET) to enable /oidc/*.
+oidc:
+  clients: []

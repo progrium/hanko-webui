@@ -12,6 +12,7 @@ FROM gcr.io/distroless/static:nonroot
 COPY --from=builder /out/hankoid /hankoid
 COPY deploy/config.yaml /config/config.yaml
 USER 65532:65532
-EXPOSE 8000 8001 8080
+# 8001 (Hanko admin API) is deliberately not exposed; it listens on loopback only.
+EXPOSE 8000 8080
 ENTRYPOINT ["/hankoid"]
 CMD ["serve", "all", "--config", "/config/config.yaml"]
